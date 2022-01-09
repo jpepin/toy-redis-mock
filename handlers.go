@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"log"
 	"net"
 )
 
@@ -15,219 +16,175 @@ var nullBulkString = "$-1\r\n"
 
 func handleConnection(conn net.Conn, ds *DataStore) {
 	defer conn.Close()
+	l := log.Default()
 	scanner := bufio.NewScanner(conn)
 	// Set the split function for the scanning operation.
 	scanner.Split(ScanCRLF)
 
-	reportedError := false
+	h := &ScanHandler{
+		conn:    conn,
+		scanner: scanner,
+		ds:      ds,
+	}
 	for scanner.Scan() {
-		data := scanner.Text()
-		fmt.Printf("fake-redis received: %s\n", data)
-		switch {
-		// this is a RESP Array
-		case data[0] == '*':
-			continue
-		// RESP Bulk Strings
-		case data[0] == '$':
-			continue
-		// The client requesting available commands
-		case data == "COMMAND":
-			conn.Write([]byte(nullBulkString))
-		case data == set:
-			cErr := HandleSetCall(conn, scanner, ds)
-			if cErr != nil {
-				fmt.Printf("Problem writing to connection: %+v\n", cErr)
-				return
-			}
-			reportedError = false
-		case data == get:
-			cErr := HandleGetCall(conn, scanner, ds)
-			if cErr != nil {
-				fmt.Printf("Problem writing to connection: %+v\n", cErr)
-				return
-			}
-			reportedError = false
-		case data == del:
-			cErr := HandleDelCall(conn, scanner, ds)
-			if cErr != nil {
-				fmt.Printf("Problem writing to connection: %+v\n", cErr)
-				return
-			}
-			reportedError = false
-		default:
-			fmt.Printf("Received unsupported input '%s'\n", data)
-			// avoid spamming error until we receive a good input again
-			if !reportedError {
-				_, conErr := conn.Write(formatRESPError("not supported"))
-				if conErr != nil {
-					fmt.Printf("Problem writing to connection: %+v\n", conErr)
-					return
-				}
-				reportedError = true
-			}
+		sErr := h.HandleScannerInput()
+		if sErr != nil {
+			l.Printf("Fatal: Problem handling input: %s", sErr.Error())
+			return
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		fmt.Printf("Problem reading input: %s", err)
-	}
-	fmt.Printf("Done reading from conn\n")
+	l.Printf("Connection closed")
 }
 
-func HandleSetCall(conn net.Conn, scanner *bufio.Scanner, ds *DataStore) error {
-	fmt.Printf("Set operation called\n")
+type ScanHandler struct {
+	conn                 net.Conn
+	scanner              *bufio.Scanner
+	reportedNotSupported bool
+	ds                   *DataStore
+}
+
+func (sh *ScanHandler) HandleScannerInput() error {
+	data := sh.scanner.Text()
+	switch {
+	// this is a RESP Array
+	case data[0] == '*':
+		return nil
+	// RESP Bulk Strings
+	case data[0] == '$':
+		return nil
+	// The client requesting available commands
+	case data == "COMMAND":
+		sh.conn.Write([]byte(nullBulkString))
+	case data == set:
+		cErr := sh.HandleSetCall()
+		if cErr != nil {
+			return fmt.Errorf("problem with set: %+v", cErr)
+		}
+		sh.reportedNotSupported = false
+	case data == get:
+		cErr := sh.HandleGetCall()
+		if cErr != nil {
+			return fmt.Errorf("problem with get: %+v", cErr)
+		}
+		sh.reportedNotSupported = false
+	case data == del:
+		cErr := sh.HandleDelCall()
+		if cErr != nil {
+			return fmt.Errorf("problem with delete: %+v", cErr)
+		}
+		sh.reportedNotSupported = false
+	default:
+		log.Default().Printf("Received unsupported input '%s'", data)
+		// avoid spamming error until we receive a good input again
+		if !sh.reportedNotSupported {
+			_, conErr := sh.conn.Write(formatRESPError("not supported"))
+			if conErr != nil {
+				return fmt.Errorf("problem writing to connection: %+v", conErr)
+			}
+			sh.reportedNotSupported = true
+		}
+	}
+	return sh.scanner.Err()
+}
+
+func (sh *ScanHandler) HandleSetCall() error {
 	// determine type of key being set
-	if scanner.Scan() {
-		valType := scanner.Text()
-		fmt.Printf("Got key type '%s'\n", valType)
+	if sh.scanner.Scan() {
+		valType := sh.scanner.Text()
 		if vErr := checkSupportedRESPType(valType); vErr != nil {
-			conn.Write(formatRESPError(vErr.Error()))
+			sh.conn.Write(formatRESPError(vErr.Error()))
 			return vErr
 		}
 	}
 	var key string
 	var value string
-	if scanner.Scan() {
-		key = scanner.Text()
-		fmt.Printf("Got key '%s'\n", key)
+	if sh.scanner.Scan() {
+		key = sh.scanner.Text()
 	}
 	// determine type of value being set
 	var valType string
-	if scanner.Scan() {
-		rawType := scanner.Text()
-		fmt.Printf("Got value type '%s'\n", rawType)
+	if sh.scanner.Scan() {
+		rawType := sh.scanner.Text()
 		if vErr := checkSupportedRESPType(rawType); vErr != nil {
-			conn.Write(formatRESPError(vErr.Error()))
+			sh.conn.Write(formatRESPError(vErr.Error()))
 			return vErr
 		}
 		valType = parseRawValType(rawType)
 	}
-	if scanner.Scan() {
-		value = scanner.Text()
-		fmt.Printf("Got value '%s', type %s\n", value, valType)
+	if sh.scanner.Scan() {
+		value = sh.scanner.Text()
 	}
-	sErr := handleSet(key, value, valType, ds)
+	sErr := handleSet(key, value, valType, sh.ds)
 	if sErr != nil {
-		conn.Write(formatRESPError(sErr.Error()))
+		sh.conn.Write(formatRESPError(sErr.Error()))
 	}
-	n, cErr := conn.Write(formatRESPString("OK"))
+	_, cErr := sh.conn.Write(formatRESPString("OK"))
 	if cErr != nil {
-		fmt.Printf("Problem writing to connection: %+v\n", cErr)
-		return cErr
+		return fmt.Errorf("problem writing to connection: %+v", cErr)
 	}
-	fmt.Printf("Wrote %d bytes to conn\n", n)
 	return nil
-}
-
-func parseRawValType(raw string) string {
-	if len(raw) == 0 {
-		return ErrorType
-	}
-	typeChar := string(raw[0])
-	switch typeChar {
-	case SimpleStringType:
-		return SimpleStringType
-	case IntegerType:
-		return IntegerType
-	case BulkStringType:
-		return BulkStringType
-	}
-	return ErrorType
-}
-
-func formatRESPResponse(message string) []byte {
-	return []byte(fmt.Sprintf("%s\r\n", message))
-}
-
-func formatRESPError(message string) []byte {
-	return formatRESPResponse(fmt.Sprintf("%s%s", ErrorType, message))
-}
-
-func formatRESPString(message string) []byte {
-	return formatRESPResponse(fmt.Sprintf("%s%s", SimpleStringType, message))
-}
-
-func formatRESPInt(message int) []byte {
-	return formatRESPResponse(fmt.Sprintf("%s%d", IntegerType, message))
 }
 
 func handleSet(key, value, oType string, ds *DataStore) error {
 	if key == "" || value == "" {
-		fmt.Printf("Received unsupported input '%s', '%s'\n", key, value)
-		return fmt.Errorf("unsupported command")
+		log.Default().Printf("Received unsupported input '%s', '%s'", key, value)
+		return fmt.Errorf("unsupported input type")
 	}
-	fmt.Printf("Will set %s as %s\n", key, value)
+	log.Default().Printf("SET %s as %s", key, value)
 	ds.Write(key, value, oType)
 	return nil
 }
 
-func HandleGetCall(conn net.Conn, scanner *bufio.Scanner, ds *DataStore) error {
-	fmt.Printf("Get operation called\n")
+func (sh *ScanHandler) HandleGetCall() error {
 	// determine type of key being set
-	if scanner.Scan() {
-		valType := scanner.Text()
-		fmt.Printf("Got key type '%s'\n", valType)
+	if sh.scanner.Scan() {
+		valType := sh.scanner.Text()
 		if vErr := checkSupportedRESPType(valType); vErr != nil {
 			return vErr
 		}
 	}
 	var key string
-	if scanner.Scan() {
-		key = scanner.Text()
-		fmt.Printf("Got key '%s'\n", key)
+	if sh.scanner.Scan() {
+		key = sh.scanner.Text()
 	}
-	val, ok := ds.Read(key)
+	log.Default().Printf("GET %s", key)
+	val, ok := sh.ds.Read(key)
 	var cErr error
-	var n int
 	if ok {
-		n, cErr = conn.Write(formatRESPResponse(val))
+		_, cErr = sh.conn.Write(formatRESPResponse(val))
 	} else {
 		// return an explicit nil
-		n, cErr = conn.Write([]byte(nullBulkString))
+		_, cErr = sh.conn.Write([]byte(nullBulkString))
 	}
 	if cErr != nil {
-		fmt.Printf("Problem writing to connection: %+v\n", cErr)
-		return cErr
+		return fmt.Errorf("problem writing to connection: %+v", cErr)
 	}
-	fmt.Printf("Wrote %d bytes to conn\n", n)
 	return nil
 }
 
-func HandleDelCall(conn net.Conn, scanner *bufio.Scanner, ds *DataStore) error {
-	fmt.Printf("Delete operation called\n")
+func (sh *ScanHandler) HandleDelCall() error {
 	// determine type of key being set
-	if scanner.Scan() {
-		valType := scanner.Text()
-		fmt.Printf("Got key type '%s'\n", valType)
+	if sh.scanner.Scan() {
+		valType := sh.scanner.Text()
 		if vErr := checkSupportedRESPType(valType); vErr != nil {
 			return vErr
 		}
 	}
 	var key string
-	if scanner.Scan() {
-		key = scanner.Text()
-		fmt.Printf("Got key '%s'\n", key)
+	if sh.scanner.Scan() {
+		key = sh.scanner.Text()
 	}
-	deletedCount := ds.Delete(key)
+	log.Default().Printf("DEL %s", key)
+	deletedCount := sh.ds.Delete(key)
 	var cErr error
-	var n int
 	if deletedCount > 0 {
-		n, cErr = conn.Write(formatRESPInt(deletedCount))
+		_, cErr = sh.conn.Write(formatRESPInt(deletedCount))
 	} else {
 		// return an explicit nil
-		n, cErr = conn.Write([]byte(nullBulkString))
+		_, cErr = sh.conn.Write([]byte(nullBulkString))
 	}
 	if cErr != nil {
-		fmt.Printf("Problem writing to connection: %+v\n", cErr)
-		return cErr
-	}
-	fmt.Printf("Wrote %d bytes to conn\n", n)
-	return nil
-}
-
-func checkSupportedRESPType(valType string) error {
-	if valType[0] != bulkString {
-		fmt.Printf("Received unsupported input '%b'\n", valType[0])
-		return fmt.Errorf("%b type not supported", valType[0])
+		return fmt.Errorf("problem writing to connection: %+v", cErr)
 	}
 	return nil
 }
