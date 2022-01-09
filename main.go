@@ -5,6 +5,7 @@ import (
 	"net"
 )
 
+// TODO: handle concurrent connections with cap
 func main() {
 	ln, err := net.Listen("tcp", "localhost:6379")
 	if err != nil {

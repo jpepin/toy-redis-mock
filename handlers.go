@@ -58,7 +58,7 @@ func handleConnection(conn net.Conn, ds *DataStore) {
 			fmt.Printf("Received unsupported input '%s'\n", data)
 			// avoid spamming error until we receive a good input again
 			if !reportedError {
-				_, conErr := conn.Write(formatSimpleString("not supported"))
+				_, conErr := conn.Write(formatRESPError("not supported"))
 				if conErr != nil {
 					fmt.Printf("Problem writing to connection: %+v\n", conErr)
 					return
@@ -80,7 +80,7 @@ func HandleSetCall(conn net.Conn, scanner *bufio.Scanner, ds *DataStore) error {
 		valType := scanner.Text()
 		fmt.Printf("Got key type '%s'\n", valType)
 		if vErr := checkSupportedRESPType(valType); vErr != nil {
-			conn.Write(formatSimpleString(vErr.Error()))
+			conn.Write(formatRESPError(vErr.Error()))
 			return vErr
 		}
 	}
@@ -91,23 +91,25 @@ func HandleSetCall(conn net.Conn, scanner *bufio.Scanner, ds *DataStore) error {
 		fmt.Printf("Got key '%s'\n", key)
 	}
 	// determine type of value being set
+	var valType string
 	if scanner.Scan() {
-		valType := scanner.Text()
-		fmt.Printf("Got value type '%s'\n", valType)
-		if vErr := checkSupportedRESPType(valType); vErr != nil {
-			conn.Write(formatSimpleString(vErr.Error()))
+		rawType := scanner.Text()
+		fmt.Printf("Got value type '%s'\n", rawType)
+		if vErr := checkSupportedRESPType(rawType); vErr != nil {
+			conn.Write(formatRESPError(vErr.Error()))
 			return vErr
 		}
+		valType = parseRawValType(rawType)
 	}
 	if scanner.Scan() {
 		value = scanner.Text()
-		fmt.Printf("Got value '%s'\n", value)
+		fmt.Printf("Got value '%s', type %s\n", value, valType)
 	}
-	sErr := handleSet(key, value, ds)
+	sErr := handleSet(key, value, valType, ds)
 	if sErr != nil {
-		conn.Write(formatSimpleString(sErr.Error()))
+		conn.Write(formatRESPError(sErr.Error()))
 	}
-	n, cErr := conn.Write(formatSimpleString("OK"))
+	n, cErr := conn.Write(formatRESPString("OK"))
 	if cErr != nil {
 		fmt.Printf("Problem writing to connection: %+v\n", cErr)
 		return cErr
@@ -116,17 +118,45 @@ func HandleSetCall(conn net.Conn, scanner *bufio.Scanner, ds *DataStore) error {
 	return nil
 }
 
-func formatSimpleString(message string) []byte {
-	return []byte(fmt.Sprintf("+%s\r\n", message))
+func parseRawValType(raw string) string {
+	if len(raw) == 0 {
+		return ErrorType
+	}
+	typeChar := string(raw[0])
+	switch typeChar {
+	case SimpleStringType:
+		return SimpleStringType
+	case IntegerType:
+		return IntegerType
+	case BulkStringType:
+		return BulkStringType
+	}
+	return ErrorType
 }
 
-func handleSet(key, value string, ds *DataStore) error {
+func formatRESPResponse(message string) []byte {
+	return []byte(fmt.Sprintf("%s\r\n", message))
+}
+
+func formatRESPError(message string) []byte {
+	return formatRESPResponse(fmt.Sprintf("%s%s", ErrorType, message))
+}
+
+func formatRESPString(message string) []byte {
+	return formatRESPResponse(fmt.Sprintf("%s%s", SimpleStringType, message))
+}
+
+func formatRESPInt(message int) []byte {
+	return formatRESPResponse(fmt.Sprintf("%s%d", IntegerType, message))
+}
+
+func handleSet(key, value, oType string, ds *DataStore) error {
 	if key == "" || value == "" {
 		fmt.Printf("Received unsupported input '%s', '%s'\n", key, value)
 		return fmt.Errorf("unsupported command")
 	}
 	fmt.Printf("Will set %s as %s\n", key, value)
-	ds.Write(key, value)
+	ds.Write(key, value, oType)
 	return nil
 }
 
@@ -145,12 +175,11 @@ func HandleGetCall(conn net.Conn, scanner *bufio.Scanner, ds *DataStore) error {
 		key = scanner.Text()
 		fmt.Printf("Got key '%s'\n", key)
 	}
-	// TODO: handle types
 	val, ok := ds.Read(key)
 	var cErr error
 	var n int
 	if ok {
-		n, cErr = conn.Write(formatSimpleString(val))
+		n, cErr = conn.Write(formatRESPResponse(val))
 	} else {
 		// return an explicit nil
 		n, cErr = conn.Write([]byte(nullBulkString))
@@ -178,13 +207,11 @@ func HandleDelCall(conn net.Conn, scanner *bufio.Scanner, ds *DataStore) error {
 		key = scanner.Text()
 		fmt.Printf("Got key '%s'\n", key)
 	}
-	// TODO: handle types
-	val, ok := ds.Delete(key)
+	deletedCount := ds.Delete(key)
 	var cErr error
 	var n int
-	// TODO: handle types
-	if ok {
-		n, cErr = conn.Write(formatSimpleString(val))
+	if deletedCount > 0 {
+		n, cErr = conn.Write(formatRESPInt(deletedCount))
 	} else {
 		// return an explicit nil
 		n, cErr = conn.Write([]byte(nullBulkString))

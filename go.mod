@@ -1,3 +1,3 @@
-module github.com/jpepin/redis-mock
+module github.com/jpepin/toy-redis-mock
 
 go 1.16
