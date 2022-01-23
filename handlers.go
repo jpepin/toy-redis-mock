@@ -14,26 +14,40 @@ var del = "del"
 var bulkString byte = '$'
 var nullBulkString = "$-1\r\n"
 
-func handleConnection(conn net.Conn, ds *DataStore) {
-	defer conn.Close()
+type ConnHandler struct {
+	conn     net.Conn
+	err      error
+	shutdown chan struct{}
+}
+
+func (ch ConnHandler) Handle(ds *DataStore) {
+	defer ch.conn.Close()
 	l := log.Default()
-	scanner := bufio.NewScanner(conn)
+	scanner := bufio.NewScanner(ch.conn)
 	// Set the split function for the scanning operation.
 	scanner.Split(ScanCRLF)
 
 	h := &ScanHandler{
-		conn:    conn,
+		conn:    ch.conn,
 		scanner: scanner,
 		ds:      ds,
 	}
-	for scanner.Scan() {
-		sErr := h.HandleScannerInput()
-		if sErr != nil {
-			l.Printf("Fatal: Problem handling input: %s", sErr.Error())
+	for {
+		select {
+		case <-ch.shutdown:
+			log.Printf("Shutdown signal received by conn handler")
 			return
+		default:
+			// TODO: this blocks waiting for data
+			if scanner.Scan() {
+				sErr := h.HandleScannerInput()
+				if sErr != nil {
+					l.Printf("Fatal: Problem handling input: %s", sErr.Error())
+					return
+				}
+			}
 		}
 	}
-	l.Printf("Connection closed")
 }
 
 type ScanHandler struct {
