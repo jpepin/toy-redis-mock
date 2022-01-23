@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"os"
@@ -17,9 +16,13 @@ func main() {
 	}
 	defer ln.Close()
 	l := log.Default()
-	l.Printf("Listening on %s", addr)
-	// set up in-memory data store
 	ds := NewDataStore()
+	// Set a low default for connections allowed,
+	// since this is probably running on a local machine
+	maxConnections := 3
+	l.Printf("Max connections set to %d", maxConnections)
+	pool := NewConnPoll(maxConnections, ln)
+	pool.RequestNewConnection()
 
 	// handle shutdown signals gracefully
 	signalChan := make(chan os.Signal, 1)
@@ -30,56 +33,31 @@ func main() {
 		syscall.SIGTERM,
 		os.Interrupt,
 	)
-
-	// Set a low default for connections allowed,
-	// since this is probably running on a local machine
-	maxConnections := 3
-	newConnsAllowed := make(chan bool, maxConnections)
-	for i := 0; i < maxConnections; i++ {
-		newConnsAllowed <- true
-	}
-	l.Printf("Max connections set to %d", maxConnections)
-
-	// Shutdown signal channels for each connection
-	connHandlers := make(map[chan struct{}]bool)
-	// new connections will be added here
-	newConns := make(chan *ConnHandler)
+	l.Printf("Listening on %s", addr)
 	for {
 		select {
 		case sig := <-signalChan:
 			log.Printf("Received signal %v, closing connections", sig)
-			for c := range connHandlers {
-				c <- struct{}{}
-			}
-			fmt.Printf("Finished signalling handlers, exiting")
+			pool.Shutdown()
+			l.Printf("Finished signalling handlers, exiting")
 			os.Exit(0)
-		case ch := <-newConns:
+		case ch := <-pool.connsToHandle:
 			go func() {
 				defer func() {
-					newConnsAllowed <- true
-					delete(connHandlers, ch.shutdown)
-					l.Printf("Active connections: %d", len(connHandlers))
+					pool.Deregister(ch)
+					pool.RequestNewConnection()
+					l.Printf("Active connections: %d", pool.ActiveConnections())
 				}()
 				shutdownChan := make(chan struct{})
-				connHandlers[shutdownChan] = true
 				ch.shutdown = shutdownChan
-				l.Printf("Active connections: %d", len(connHandlers))
+				pool.Register(ch)
+				l.Printf("Active connections: %d", pool.ActiveConnections())
 				ch.Handle(&ds)
 			}()
-		case <-newConnsAllowed:
-			go func() {
-				log.Printf("Listening for connections...")
-				conn, err := ln.Accept()
-				// don't handle connection errors, just bail
-				if err != nil {
-					l.Fatalf("Problem opening TCP conn: %+v", err)
-					return
-				}
-				nc := &ConnHandler{
-					conn: conn,
-				}
-				newConns <- nc
-			}()
+		case <-pool.newConn:
+			go pool.Accept()
+		case err := <-pool.errs:
+			l.Printf("Error: %v", err)
 		default:
 		}
 

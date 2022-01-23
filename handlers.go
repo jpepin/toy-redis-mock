@@ -16,7 +16,6 @@ var nullBulkString = "$-1\r\n"
 
 type ConnHandler struct {
 	conn     net.Conn
-	err      error
 	shutdown chan struct{}
 }
 
@@ -32,20 +31,30 @@ func (ch ConnHandler) Handle(ds *DataStore) {
 		scanner: scanner,
 		ds:      ds,
 	}
+	readClosed := make(chan struct{})
+	// Don't block the rest of our processing on the scanner
+	go func() {
+		for scanner.Scan() {
+			sErr := h.HandleScannerInput()
+			if sErr != nil {
+				l.Printf("Fatal: Problem handling input: %s", sErr.Error())
+				h.err = sErr
+				readClosed <- struct{}{}
+				return
+			}
+		}
+		ch.shutdown <- struct{}{}
+	}()
+
 	for {
 		select {
 		case <-ch.shutdown:
-			log.Printf("Shutdown signal received by conn handler")
+			log.Printf("Handler: shutdown signal received")
+			return
+		case <-readClosed:
+			log.Printf("Handler: closing connection due to input error: %v", h.err)
 			return
 		default:
-			// TODO: this blocks waiting for data
-			if scanner.Scan() {
-				sErr := h.HandleScannerInput()
-				if sErr != nil {
-					l.Printf("Fatal: Problem handling input: %s", sErr.Error())
-					return
-				}
-			}
 		}
 	}
 }
@@ -55,6 +64,7 @@ type ScanHandler struct {
 	scanner              *bufio.Scanner
 	reportedNotSupported bool
 	ds                   *DataStore
+	err                  error
 }
 
 func (sh *ScanHandler) HandleScannerInput() error {
